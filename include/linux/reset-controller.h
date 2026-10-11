@@ -28,6 +28,7 @@ struct reset_control_ops {
 struct module;
 struct device_node;
 struct of_phandle_args;
+struct revocable;
 
 /**
  * struct reset_controller_dev - reset controller entity that might
@@ -51,6 +52,7 @@ struct of_phandle_args;
  *             serialize the shared reset, assert and deassert paths under a
  *             mutex
  * @lock: protects the reset control list from concurrent access
+ * @revocable: revocable provider handle for itself
  */
 struct reset_controller_dev {
 	const struct reset_control_ops *ops;
@@ -69,6 +71,7 @@ struct reset_controller_dev {
 	unsigned int nr_resets;
 	bool can_sleep;
 	struct mutex lock;
+	struct revocable *revocable;
 };
 
 #if IS_ENABLED(CONFIG_RESET_CONTROLLER)

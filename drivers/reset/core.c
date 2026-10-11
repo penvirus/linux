@@ -24,8 +24,8 @@
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/reset-controller.h>
+#include <linux/revocable.h>
 #include <linux/slab.h>
-#include <linux/srcu.h>
 
 static DEFINE_MUTEX(reset_list_mutex);
 static LIST_HEAD(reset_controller_list);
@@ -37,9 +37,7 @@ static DEFINE_IDA(reset_gpio_ida);
 
 /**
  * struct reset_control - a reset control
- * @rcdev: a pointer to the reset controller device
- *         this reset control belongs to
- * @srcu: protects the rcdev pointer from removal during consumer access
+ * @rcdev_revocable: revocable handle for accessing the reset controller device
  * @list: list entry for the rcdev's reset controller list
  * @id: ID of the reset controller in the reset
  *      controller device
@@ -54,8 +52,7 @@ static DEFINE_IDA(reset_gpio_ida);
  * @lock: serializes the internals of reset_control_acquire()
  */
 struct reset_control {
-	struct reset_controller_dev __rcu *rcdev;
-	struct srcu_struct srcu;
+	struct revocable *rcdev_revocable;
 	struct list_head list;
 	unsigned int id;
 	struct kref refcnt;
@@ -141,6 +138,10 @@ int reset_controller_register(struct reset_controller_dev *rcdev)
 			return -EINVAL;
 	}
 
+	rcdev->revocable = revocable_alloc(rcdev);
+	if (!rcdev->revocable)
+		return -ENOMEM;
+
 	if (rcdev->of_xlate)
 		rcdev->fwnode_reset_n_cells = rcdev->of_reset_n_cells;
 
@@ -160,14 +161,20 @@ int reset_controller_register(struct reset_controller_dev *rcdev)
 }
 EXPORT_SYMBOL_GPL(reset_controller_register);
 
-static void reset_control_put_internal(struct reset_control *rstc);
-
 static void reset_controller_remove(struct reset_controller_dev *rcdev,
 				    struct reset_control *rstc)
 {
 	lockdep_assert_held(&rcdev->lock);
 
-	list_del(&rstc->list);
+	/*
+	 * reset_control_put_internal() may observe a non-NULL rcdev before
+	 * revocable_revoke() runs, and then wait on rcdev->lock while
+	 * reset_controller_unregister() already detaches rstc.
+	 */
+	if (list_empty(&rstc->list))
+		return;
+	list_del_init(&rstc->list);
+
 	module_put(rcdev->owner);
 	put_device(rcdev->dev);
 }
@@ -179,38 +186,22 @@ static void reset_controller_remove(struct reset_controller_dev *rcdev,
 void reset_controller_unregister(struct reset_controller_dev *rcdev)
 {
 	struct reset_control *rstc, *pos;
-	LIST_HEAD(reset_control_head);
 
 	scoped_guard(mutex, &reset_list_mutex)
 		list_del(&rcdev->list);
 
 	scoped_guard(mutex, &rcdev->lock) {
-		/*
-		 * Numb but don't free the remaining reset control handles that are
-		 * still held by consumers.
-		 *
-		 * Hold a temporary reference on rstc before clearing rstc->rcdev:
-		 * once rstc->rcdev is NULL, a concurrent reset_control_put_internal()
-		 * will not acquire rcdev->lock and could otherwise free rstc.
-		 */
-		list_for_each_entry_safe(rstc, pos, &rcdev->reset_control_head, list) {
-			kref_get(&rstc->refcnt);
-			rcu_assign_pointer(rstc->rcdev, NULL);
+		list_for_each_entry_safe(rstc, pos, &rcdev->reset_control_head, list)
 			reset_controller_remove(rcdev, rstc);
-			list_add(&rstc->list, &reset_control_head);
-		}
 	}
 
 	/*
-	 * Run synchronize_srcu() outside rcdev->lock to avoid a circular
+	 * Run revocable_revoke() outside rcdev->lock to avoid a circular
 	 * locking dependency with paths that acquire rcdev->lock inside
-	 * the rstc->srcu read-side critical section.
+	 * the revocable read-side critical section.
 	 */
-	list_for_each_entry_safe(rstc, pos, &reset_control_head, list) {
-		list_del(&rstc->list);
-		synchronize_srcu(&rstc->srcu);
-		reset_control_put_internal(rstc);
-	}
+	revocable_revoke(rcdev->revocable);
+	revocable_put(rcdev->revocable);
 
 	mutex_destroy(&rcdev->lock);
 }
@@ -401,11 +392,7 @@ int reset_control_reset(struct reset_control *rstc)
 	if (reset_control_is_array(rstc))
 		return reset_control_array_reset(rstc_to_array(rstc));
 
-	guard(srcu)(&rstc->srcu);
-
-	rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-	if (!rcdev)
-		return -ENODEV;
+	revocable_try_access_or_return(rstc->rcdev_revocable, rcdev);
 
 	if (!rcdev->ops->reset)
 		return -ENOTSUPP;
@@ -522,11 +509,7 @@ int reset_control_assert(struct reset_control *rstc)
 	if (reset_control_is_array(rstc))
 		return reset_control_array_assert(rstc_to_array(rstc));
 
-	guard(srcu)(&rstc->srcu);
-
-	rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-	if (!rcdev)
-		return -ENODEV;
+	revocable_try_access_or_return(rstc->rcdev_revocable, rcdev);
 
 	if (rstc->shared) {
 		if (WARN_ON(atomic_read(&rstc->triggered_count) != 0))
@@ -618,11 +601,7 @@ int reset_control_deassert(struct reset_control *rstc)
 	if (reset_control_is_array(rstc))
 		return reset_control_array_deassert(rstc_to_array(rstc));
 
-	guard(srcu)(&rstc->srcu);
-
-	rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-	if (!rcdev)
-		return -ENODEV;
+	revocable_try_access_or_return(rstc->rcdev_revocable, rcdev);
 
 	if (rstc->shared) {
 		if (WARN_ON(atomic_read(&rstc->triggered_count) != 0))
@@ -698,11 +677,7 @@ int reset_control_status(struct reset_control *rstc)
 	if (WARN_ON(IS_ERR(rstc)) || reset_control_is_array(rstc))
 		return -EINVAL;
 
-	guard(srcu)(&rstc->srcu);
-
-	rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-	if (!rcdev)
-		return -ENODEV;
+	revocable_try_access_or_return(rstc->rcdev_revocable, rcdev);
 
 	if (rcdev->ops->status)
 		return rcdev->ops->status(rcdev, rstc->id);
@@ -750,11 +725,7 @@ int reset_control_acquire(struct reset_control *rstc)
 	if (rstc->acquired)
 		return 0;
 
-	guard(srcu)(&rstc->srcu);
-
-	rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-	if (!rcdev)
-		return -ENODEV;
+	revocable_try_access_or_return(rstc->rcdev_revocable, rcdev);
 
 	scoped_guard(mutex, &rcdev->lock) {
 		list_for_each_entry(rc, &rcdev->reset_control_head, list) {
@@ -850,7 +821,6 @@ __reset_control_get_internal(struct reset_controller_dev *rcdev,
 	bool shared = flags & RESET_CONTROL_FLAGS_BIT_SHARED;
 	bool acquired = flags & RESET_CONTROL_FLAGS_BIT_ACQUIRED;
 	struct reset_control *rstc;
-	int ret;
 
 	lockdep_assert_held(&rcdev->lock);
 
@@ -881,19 +851,13 @@ __reset_control_get_internal(struct reset_controller_dev *rcdev,
 	if (!rstc)
 		return ERR_PTR(-ENOMEM);
 
-	ret = init_srcu_struct(&rstc->srcu);
-	if (ret) {
-		kfree(rstc);
-		return ERR_PTR(ret);
-	}
-
 	if (!try_module_get(rcdev->owner)) {
-		cleanup_srcu_struct(&rstc->srcu);
 		kfree(rstc);
 		return ERR_PTR(-ENODEV);
 	}
 
-	rcu_assign_pointer(rstc->rcdev, rcdev);
+	revocable_get(rcdev->revocable);
+	rstc->rcdev_revocable = rcdev->revocable;
 	list_add(&rstc->list, &rcdev->reset_control_head);
 	rstc->id = index;
 	kref_init(&rstc->refcnt);
@@ -909,17 +873,9 @@ static void __reset_control_release(struct kref *kref)
 {
 	struct reset_control *rstc = container_of(kref, struct reset_control,
 						  refcnt);
-	struct reset_controller_dev *rcdev;
-
-	lockdep_assert_held(&rstc->srcu);
-
-	rcdev = rcu_replace_pointer(rstc->rcdev, NULL, true);
-	if (rcdev) {
-		lockdep_assert_held(&rcdev->lock);
-		reset_controller_remove(rcdev, rstc);
-	}
 
 	mutex_destroy(&rstc->lock);
+	revocable_put(rstc->rcdev_revocable);
 }
 
 static void reset_control_put_internal(struct reset_control *rstc)
@@ -930,22 +886,19 @@ static void reset_control_put_internal(struct reset_control *rstc)
 	if (IS_ERR_OR_NULL(rstc))
 		return;
 
-	scoped_guard(srcu, &rstc->srcu) {
-		rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-		if (rcdev) {
-			guard(mutex)(&rcdev->lock);
-			ret = kref_put(&rstc->refcnt, __reset_control_release);
-		} else {
-			/* Already detached from rcdev. */
-			ret = kref_put(&rstc->refcnt, __reset_control_release);
-		}
+	revocable_try_access_with(rstc->rcdev_revocable, rcdev);
+	if (rcdev) {
+		guard(mutex)(&rcdev->lock);
+		ret = kref_put(&rstc->refcnt, __reset_control_release);
+		if (ret)
+			reset_controller_remove(rcdev, rstc);
+	} else {
+		/* Already detached from rcdev. */
+		ret = kref_put(&rstc->refcnt, __reset_control_release);
 	}
 
-	if (ret) {
-		synchronize_srcu(&rstc->srcu);
-		cleanup_srcu_struct(&rstc->srcu);
+	if (ret)
 		kfree(rstc);
-	}
 }
 
 static void reset_gpio_aux_device_release(struct device *dev)

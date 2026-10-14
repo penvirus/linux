@@ -6,6 +6,8 @@
  * Copyright (c) 2025, Intel Corporation.
  */
 
+#include <linux/bits.h>
+#include <linux/io.h>
 #include <linux/pci.h>
 
 #include "core.h"
@@ -548,6 +550,9 @@ static const u8 ptl_pmc_list[] = {PMC_IDX_MAIN};
 #define PTL_NPU_PCI_DEV                0xb03e
 #define PTL_IPU_PCI_DEV                0xb05d
 
+#define ACPI_TMR_CTL_OFFSET            0x18fc
+#define ACPI_TIM_DIS                   BIT(1)
+
 /*
  * Set power state of select devices that do not have drivers to D3
  * so that they do not block Package C entry.
@@ -558,9 +563,42 @@ static void ptl_d3_fixup(void)
 	pmc_core_set_device_d3(PTL_NPU_PCI_DEV);
 }
 
+static void ptl_set_acpi_pm_timer(struct pmc_dev *pmcdev, bool suspend)
+{
+	struct pmc *pmc = pmcdev->pmcs[PMC_IDX_MAIN];
+	u8 val, old_val;
+
+	if (!pmc || !pmc->regbase)
+		return;
+
+	if (!suspend && !pmcdev->pm_timer_enabled)
+		return;
+
+	val = readb(pmc->regbase + ACPI_TMR_CTL_OFFSET);
+	old_val = val;
+
+	if (suspend) {
+		pmcdev->pm_timer_enabled = !(old_val & ACPI_TIM_DIS);
+		if (pmcdev->pm_timer_enabled)
+			val |= ACPI_TIM_DIS;
+	} else {
+		val &= ~ACPI_TIM_DIS;
+	}
+
+	if (val != old_val)
+		writeb(val, pmc->regbase + ACPI_TMR_CTL_OFFSET);
+}
+
+static void ptl_suspend(struct pmc_dev *pmcdev)
+{
+	ptl_set_acpi_pm_timer(pmcdev, true);
+	cnl_suspend(pmcdev);
+}
+
 static int ptl_resume(struct pmc_dev *pmcdev)
 {
 	ptl_d3_fixup();
+	ptl_set_acpi_pm_timer(pmcdev, false);
 	return cnl_resume(pmcdev);
 }
 
@@ -576,7 +614,7 @@ struct pmc_dev_info ptl_pmc_dev = {
 	.regmap_list = ptl_pmc_info_list,
 	.map = &ptl_pcdp_reg_map,
 	.sub_req_show = &pmc_core_substate_blk_req_fops,
-	.suspend = cnl_suspend,
+	.suspend = ptl_suspend,
 	.resume = ptl_resume,
 	.init = ptl_core_init,
 	.sub_req = pmc_core_pmt_get_blk_sub_req,

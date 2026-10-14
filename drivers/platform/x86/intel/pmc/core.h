@@ -362,6 +362,10 @@ enum ppfear_regs {
 #define PMC_DEVID_NVL_PCDS	0xd47e
 #define PMC_DEVID_NVL_PCHS	0x6e27
 
+/* ACPI PM timer */
+#define ACPI_TMR_CTL_OFFSET	0x18fc
+#define ACPI_TIM_DIS		BIT(1)
+
 extern const char *pmc_lpm_modes[];
 
 struct pmc_bit_map {
@@ -392,6 +396,8 @@ struct pmc_bit_map {
  * @num_s0ix_blocker:	Number of S0ix blockers
  * @blocker_req_offset:	Telemetry offset to S0ix blocker low power mode substate requirement table
  * @lpm_req_guid:	Telemetry GUID to read low power mode substate requirement table
+ * @acpi_pm_tmr_ctl_offset: PWRMBASE offset to ACPI PM timer control register
+ * @acpi_pm_tmr_disable_bit: Bit mask to disable ACPI PM timer
  *
  * Each PCH has unique set of register offsets and bit indexes. This structure
  * captures them to have a common implementation.
@@ -435,6 +441,9 @@ struct pmc_reg_map {
 	const u32 pson_residency_counter_step;
 	/* GUID for telemetry regions */
 	const u32 lpm_req_guid;
+	/* ACPI PM timer registers */
+	const u32 acpi_pm_tmr_ctl_offset;
+	const u8 acpi_pm_tmr_disable_bit;
 };
 
 /**
@@ -487,6 +496,7 @@ struct pmc {
  * @s0ix_counter:	S0ix residency (step adjusted)
  * @suspend:		Function to perform platform specific suspend
  * @resume:		Function to perform platform specific resume
+ * @pm_timer_enabled:	Whether the ACPI PM timer was enabled before suspend
  *
  * @pkgc_ltr_blocker_counters: Array of PKGC LTR blocker counters
  * @pkgc_ltr_blocker_offset: Offset to PKGC LTR blockers in telemetry region
@@ -506,6 +516,7 @@ struct pmc_dev {
 	u64 s0ix_counter;
 	void (*suspend)(struct pmc_dev *pmcdev);
 	int (*resume)(struct pmc_dev *pmcdev);
+	bool pm_timer_enabled;
 
 	u64 *pkgc_res_cnt;
 	u8 num_of_pkgc;

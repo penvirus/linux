@@ -16,6 +16,7 @@ enum header_type {
 	HEADER_VALUE,
 };
 
+#include <linux/acpi_pmtmr.h>
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -1923,6 +1924,38 @@ static void pmc_core_clean_structure(struct platform_device *pdev)
 	platform_set_drvdata(pdev, NULL);
 }
 
+static void pmc_core_set_acpi_pm_timer(void *data, bool suspend)
+{
+	struct pmc_dev *pmcdev = data;
+	struct pmc *pmc = pmcdev->pmcs[PMC_IDX_MAIN];
+	const struct pmc_reg_map *map;
+	u8 val, old_val;
+
+	if (!pmc || !pmc->regbase || !pmc->map)
+		return;
+
+	map = pmc->map;
+	if (!map->acpi_pm_tmr_ctl_offset)
+		return;
+
+	if (!suspend && !pmcdev->pm_timer_enabled)
+		return;
+
+	val = readb(pmc->regbase + map->acpi_pm_tmr_ctl_offset);
+	old_val = val;
+
+	if (suspend) {
+		pmcdev->pm_timer_enabled = !(old_val & map->acpi_pm_tmr_disable_bit);
+		if (pmcdev->pm_timer_enabled)
+			val |= map->acpi_pm_tmr_disable_bit;
+	} else {
+		val &= ~map->acpi_pm_tmr_disable_bit;
+	}
+
+	if (val != old_val)
+		writeb(val, pmc->regbase + map->acpi_pm_tmr_ctl_offset);
+}
+
 static int pmc_core_probe(struct platform_device *pdev)
 {
 	static bool device_initialized;
@@ -1985,6 +2018,11 @@ static int pmc_core_probe(struct platform_device *pdev)
 	pm_report_max_hw_sleep(FIELD_MAX(SLP_S0_RES_COUNTER_MASK) *
 			       pmc_core_adjust_slp_s0_step(primary_pmc, 1));
 
+	if (IS_ENABLED(CONFIG_X86_PM_TIMER) &&
+	    primary_pmc->map->acpi_pm_tmr_ctl_offset)
+		acpi_pmtmr_register_suspend_resume_callback(pmc_core_set_acpi_pm_timer,
+							    pmcdev);
+
 	device_initialized = true;
 	dev_info(&pdev->dev, " initialized\n");
 
@@ -1994,6 +2032,11 @@ static int pmc_core_probe(struct platform_device *pdev)
 static void pmc_core_remove(struct platform_device *pdev)
 {
 	struct pmc_dev *pmcdev = platform_get_drvdata(pdev);
+
+	if (IS_ENABLED(CONFIG_X86_PM_TIMER) &&
+	    pmcdev->pmcs[PMC_IDX_MAIN]->map->acpi_pm_tmr_ctl_offset)
+		acpi_pmtmr_unregister_suspend_resume_callback();
+
 	pmc_core_dbgfs_unregister(pmcdev);
 	pmc_core_clean_structure(pdev);
 }
@@ -2031,6 +2074,9 @@ static __maybe_unused int pmc_core_suspend(struct device *dev)
 	/* Save S0ix residency for checking later */
 	if (pmc_core_dev_state_get(pmc, &pmcdev->s0ix_counter))
 		return -EIO;
+
+	if (!IS_ENABLED(CONFIG_X86_PM_TIMER))
+		pmc_core_set_acpi_pm_timer(pmcdev, true);
 
 	return 0;
 }
@@ -2123,6 +2169,9 @@ int pmc_core_resume_common(struct pmc_dev *pmcdev)
 static __maybe_unused int pmc_core_resume(struct device *dev)
 {
 	struct pmc_dev *pmcdev = dev_get_drvdata(dev);
+
+	if (!IS_ENABLED(CONFIG_X86_PM_TIMER))
+		pmc_core_set_acpi_pm_timer(pmcdev, false);
 
 	if (ltr_ignore_all_suspend)
 		pmc_core_ltr_restore_all(pmcdev);

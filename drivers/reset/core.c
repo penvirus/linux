@@ -160,6 +160,8 @@ int reset_controller_register(struct reset_controller_dev *rcdev)
 }
 EXPORT_SYMBOL_GPL(reset_controller_register);
 
+static void reset_control_put_internal(struct reset_control *rstc);
+
 static void reset_controller_remove(struct reset_controller_dev *rcdev,
 				    struct reset_control *rstc)
 {
@@ -185,11 +187,17 @@ void reset_controller_unregister(struct reset_controller_dev *rcdev)
 		/*
 		 * Numb but don't free the remaining reset control handles that are
 		 * still held by consumers.
+		 *
+		 * Hold a temporary reference on rstc before clearing rstc->rcdev:
+		 * once rstc->rcdev is NULL, a concurrent reset_control_put_internal()
+		 * will not acquire rcdev->lock and could otherwise free rstc.
 		 */
 		list_for_each_entry_safe(rstc, pos, &rcdev->reset_control_head, list) {
+			kref_get(&rstc->refcnt);
 			rcu_assign_pointer(rstc->rcdev, NULL);
 			synchronize_srcu(&rstc->srcu);
 			reset_controller_remove(rcdev, rstc);
+			reset_control_put_internal(rstc);
 		}
 	}
 
@@ -913,12 +921,13 @@ static void reset_control_put_internal(struct reset_control *rstc)
 
 	scoped_guard(srcu, &rstc->srcu) {
 		rcdev = srcu_dereference(rstc->rcdev, &rstc->srcu);
-		if (!rcdev)
-			/* Already released. */
-			return;
-
-		guard(mutex)(&rcdev->lock);
-		ret = kref_put(&rstc->refcnt, __reset_control_release);
+		if (rcdev) {
+			guard(mutex)(&rcdev->lock);
+			ret = kref_put(&rstc->refcnt, __reset_control_release);
+		} else {
+			/* Already detached from rcdev. */
+			ret = kref_put(&rstc->refcnt, __reset_control_release);
+		}
 	}
 
 	if (ret) {

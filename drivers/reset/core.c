@@ -179,6 +179,7 @@ static void reset_controller_remove(struct reset_controller_dev *rcdev,
 void reset_controller_unregister(struct reset_controller_dev *rcdev)
 {
 	struct reset_control *rstc, *pos;
+	LIST_HEAD(reset_control_head);
 
 	scoped_guard(mutex, &reset_list_mutex)
 		list_del(&rcdev->list);
@@ -195,10 +196,20 @@ void reset_controller_unregister(struct reset_controller_dev *rcdev)
 		list_for_each_entry_safe(rstc, pos, &rcdev->reset_control_head, list) {
 			kref_get(&rstc->refcnt);
 			rcu_assign_pointer(rstc->rcdev, NULL);
-			synchronize_srcu(&rstc->srcu);
 			reset_controller_remove(rcdev, rstc);
-			reset_control_put_internal(rstc);
+			list_add(&rstc->list, &reset_control_head);
 		}
+	}
+
+	/*
+	 * Run synchronize_srcu() outside rcdev->lock to avoid a circular
+	 * locking dependency with paths that acquire rcdev->lock inside
+	 * the rstc->srcu read-side critical section.
+	 */
+	list_for_each_entry_safe(rstc, pos, &reset_control_head, list) {
+		list_del(&rstc->list);
+		synchronize_srcu(&rstc->srcu);
+		reset_control_put_internal(rstc);
 	}
 
 	mutex_destroy(&rcdev->lock);

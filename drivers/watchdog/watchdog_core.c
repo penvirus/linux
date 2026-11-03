@@ -73,17 +73,7 @@ static void watchdog_deferred_registration_add(struct watchdog_device *wdd)
 
 static void watchdog_deferred_registration_del(struct watchdog_device *wdd)
 {
-	struct list_head *p;
-	struct watchdog_device *wdd_tmp;
-
-	list_for_each(p, &wtd_deferred_reg_list) {
-		wdd_tmp = list_entry(p, struct watchdog_device,
-				     deferred);
-		if (wdd_tmp == wdd) {
-			list_del(&wdd_tmp->deferred);
-			break;
-		}
-	}
+	list_del_init(&wdd->deferred);
 }
 
 static void watchdog_check_min_max_timeout(struct watchdog_device *wdd)

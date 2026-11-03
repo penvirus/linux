@@ -389,9 +389,6 @@ EXPORT_SYMBOL_GPL(watchdog_register_device);
 
 static void __watchdog_unregister_device(struct watchdog_device *wdd)
 {
-	if (wdd == NULL)
-		return;
-
 	if (wdd->ops->restart)
 		unregister_restart_handler(&wdd->restart_nb);
 

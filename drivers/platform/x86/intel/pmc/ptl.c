@@ -529,6 +529,8 @@ static const struct pmc_reg_map ptl_pcdp_reg_map = {
 	.num_s0ix_blocker = PTL_NUM_S0IX_BLOCKER,
 	.blocker_req_offset = PTL_BLK_REQ_OFFSET,
 	.lpm_req_guid = PCDP_LPM_REQ_GUID,
+	.acpi_pm_tmr_ctl_offset = ACPI_TMR_CTL_OFFSET,
+	.acpi_pm_tmr_disable_bit = ACPI_TIM_DIS,
 };
 
 static struct pmc_info ptl_pmc_info_list[] = {

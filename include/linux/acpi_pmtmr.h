@@ -48,6 +48,11 @@ static inline u32 acpi_pm_read_early(void)
 	return 0;
 }
 
+static inline void acpi_pmtmr_register_suspend_resume_callback(void (*cb)(void *data, bool suspend),
+							       void *data) {}
+
+static inline void acpi_pmtmr_unregister_suspend_resume_callback(void) {}
+
 #endif
 
 #endif
